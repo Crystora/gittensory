@@ -887,6 +887,7 @@ export class GittensoryMcp {
       pullRequests: contributorPullRequests,
       issues: contributorIssues,
       repoStats,
+      cachedRepoStats,
     });
     return {
       profile,
