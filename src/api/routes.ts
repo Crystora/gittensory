@@ -142,6 +142,7 @@ import {
   generateWeeklyValueReport,
   loadWeeklyValueReport,
 } from "../services/weekly-value-report";
+import { buildRecommendationQualityReport } from "../services/recommendation-quality-report";
 import { loadOrComputeIssueQualityResponse } from "../services/issue-quality";
 import { loadOrComputeBurdenForecastResponse } from "../services/burden-forecast";
 import { loadOrComputeRepoOutcomePatternsResponse } from "../services/repo-outcome-patterns";
@@ -847,6 +848,7 @@ export function createApp() {
       usageRollupStatus,
       mcpCompatibilityAdoption,
       commandUsefulness,
+      recommendationQuality,
     ] = await Promise.all([
       listRepositories(c.env),
       listInstallations(c.env),
@@ -862,6 +864,7 @@ export function createApp() {
       getProductUsageRollupStatus(c.env),
       summarizeMcpCompatibilityAdoption(c.env, usageSince),
       getCommandUsefulnessSummary(c.env),
+      buildRecommendationQualityReport(c.env, { windowDays: 90 }),
     ]);
     const weeklyValueReport = buildWeeklyValueReport({
       generatedAt: nowIso(),
@@ -893,6 +896,7 @@ export function createApp() {
         { label: "Activation rollups", value: usageRollupStatus.status, delta: usageRollupStatus.latestRollupDay ?? "not generated" },
         { label: "MCP stale clients", value: String(mcpCompatibilityAdoption.staleEvents + mcpCompatibilityAdoption.incompatibleEvents), delta: `${mcpCompatibilityAdoption.totalEvents} MCP event(s)` },
         { label: "Command usefulness", value: `${commandUsefulness.totals.usefulCount}/${commandUsefulness.totals.feedbackCount}`, delta: usefulnessDelta(commandUsefulness.totals.usefulnessRate) },
+        { label: "Recommendation quality", value: `${recommendationQuality.totals.positive}/${recommendationQuality.totals.total}`, delta: recommendationQuality.empty ? "no evaluated outcomes" : `${Math.round(recommendationQuality.totals.positiveRate * 100)}% positive` },
         { label: "Install issues", value: String(health.filter((record) => record.status !== "healthy").length), delta: "current health cache" },
         { label: "Rate-limit events", value: String(rateLimits.length), delta: "latest observations" },
       ],
@@ -908,6 +912,7 @@ export function createApp() {
       usageRollupStatus,
       mcpCompatibilityAdoption,
       commandUsefulness,
+      recommendationQuality,
       registry,
       scoringModel: scoring,
       upstreamDrift,
