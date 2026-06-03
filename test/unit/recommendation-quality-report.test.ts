@@ -82,6 +82,28 @@ describe("recommendation quality report", () => {
     expect(report.roleSurfaces.find((surface) => surface.role === "miner")).toMatchObject({ positive: 0, negative: 1, mediumConfidence: 1 });
   });
 
+  it("falls back to action type when metadata has no recognized role", () => {
+    const report = buildRecommendationQualityReportFromOutcomes(
+      [
+        outcome("array-without-role", "merged", {
+          actionType: "monitor_existing_pr",
+          metadata: { roles: ["reviewability", "unknown"] },
+          repo: "owner/fallback-array",
+        }),
+        outcome("non-string-role", "closed", {
+          actionType: "explain_repo_fit",
+          metadata: { actorRole: 123 },
+          repo: "owner/fallback-number",
+        }),
+      ],
+      { generatedAt: "2026-06-01T00:00:00.000Z", windowDays: 7 },
+    );
+
+    expect(report.roleSurfaces.map((surface) => surface.role)).toEqual(["maintainer", "owner"]);
+    expect(report.roleSurfaces.find((surface) => surface.role === "maintainer")).toMatchObject({ positive: 1, negative: 0 });
+    expect(report.roleSurfaces.find((surface) => surface.role === "owner")).toMatchObject({ positive: 0, negative: 1 });
+  });
+
   it("loads persisted outcomes for the operator report window", async () => {
     const env = createTestEnv();
     await createAgentRun(env, {
