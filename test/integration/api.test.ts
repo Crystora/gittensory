@@ -193,6 +193,62 @@ describe("api routes", () => {
     await expect(unavailable.json()).resolves.toMatchObject({ error: "github_repo_stats_unavailable" });
   });
 
+  it("serves the public README badge only for installed, opted-in repos (#541)", async () => {
+    const app = createApp();
+    const env = createTestEnv();
+
+    // Installed + opted in, with assessed merged PRs.
+    await upsertRepositoryFromGitHub(env, { name: "badged", full_name: "acme/badged", private: false, owner: { login: "acme" }, default_branch: "main" }, 555);
+    await upsertRepositorySettings(env, { repoFullName: "acme/badged", badgeEnabled: true });
+    await upsertPullRequestFromGitHub(env, "acme/badged", { number: 1, title: "Feature", state: "merged", created_at: "2026-06-01T00:00:00Z", merged_at: "2026-06-01T04:00:00Z", labels: [] });
+    await upsertPullRequestFromGitHub(env, "acme/badged", { number: 2, title: "Slop", state: "merged", created_at: "2026-06-02T00:00:00Z", merged_at: "2026-06-02T06:00:00Z", labels: [] });
+    await updatePullRequestSlopAssessment(env, "acme/badged", 1, { slopRisk: 0, slopBand: "clean" });
+    await updatePullRequestSlopAssessment(env, "acme/badged", 2, { slopRisk: 80, slopBand: "high" });
+
+    const svg = await app.request("/v1/public/repos/acme/badged/badge.svg", {}, env);
+    expect(svg.status).toBe(200);
+    expect(svg.headers.get("content-type")).toContain("image/svg+xml");
+    expect(svg.headers.get("cache-control")).toContain("stale-while-revalidate");
+    const svgBody = await svg.text();
+    expect(svgBody.startsWith("<svg")).toBe(true);
+    expect(svgBody).toContain("gittensory");
+    expect(svgBody).toContain("% real");
+    expect(svgBody).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
+
+    const json = await app.request("/v1/public/repos/acme/badged/badge.json", {}, env);
+    expect(json.status).toBe(200);
+    await expect(json.json()).resolves.toMatchObject({ schemaVersion: 1, label: "gittensory", message: expect.stringContaining("real") });
+
+    // Installed but NOT opted in → unavailable, no metrics.
+    await upsertRepositoryFromGitHub(env, { name: "private", full_name: "acme/private", private: false, owner: { login: "acme" }, default_branch: "main" }, 556);
+    const notOptedIn = await app.request("/v1/public/repos/acme/private/badge.svg", {}, env);
+    expect(notOptedIn.status).toBe(404);
+    expect(await notOptedIn.text()).toContain("unavailable");
+
+    // Opted in but NOT installed → unavailable.
+    await upsertRepositoryFromGitHub(env, { name: "uninstalled", full_name: "acme/uninstalled", private: false, owner: { login: "acme" }, default_branch: "main" });
+    await upsertRepositorySettings(env, { repoFullName: "acme/uninstalled", badgeEnabled: true });
+    const notInstalled = await app.request("/v1/public/repos/acme/uninstalled/badge.svg", {}, env);
+    expect(notInstalled.status).toBe(404);
+
+    // Unknown repo → unavailable shields payload.
+    const unknown = await app.request("/v1/public/repos/acme/missing/badge.json", {}, env);
+    expect(unknown.status).toBe(404);
+    await expect(unknown.json()).resolves.toMatchObject({ message: "unavailable" });
+  });
+
+  it("persists the badgeEnabled opt-in through the settings write endpoint (#541)", async () => {
+    const app = createApp();
+    const env = createTestEnv();
+    const response = await app.request(
+      "/v1/internal/repos/acme/badged/settings",
+      { method: "POST", headers: { authorization: `Bearer ${env.INTERNAL_JOB_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ badgeEnabled: true }) },
+      env,
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ repoFullName: "acme/badged", badgeEnabled: true });
+  });
+
   it("rejects invalid public GitHub repo stats paths before calling GitHub", async () => {
     const app = createApp();
     const env = createTestEnv();

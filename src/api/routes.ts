@@ -156,6 +156,8 @@ import {
 import { buildOperatorDashboardPayload } from "../services/operator-dashboard";
 import { buildSelfDogfoodRegistrationPack, resolveSelfDogfoodRepoFullName } from "../services/self-dogfood-registration-pack";
 import { buildSubnetInterfaceDescriptor } from "../services/subnet-interface";
+import { buildPublicRepoQuality, type PublicRepoQuality } from "../services/public-repo-quality";
+import { buildShieldsBadge, renderBadgeSvg, renderUnavailableBadgeSvg } from "./badge";
 import {
   buildWeeklyValueReport,
   formatWeeklyValueReportMarkdown,
@@ -235,6 +237,18 @@ import { errorMessage, nowIso } from "../utils/json";
 
 type AppBindings = { Bindings: Env };
 type AppContext = Context<AppBindings>;
+
+// Resolves the public README badge metrics for a repo, enforcing the two gates in one place: the repo must
+// be installed AND have opted in via `badgeEnabled`. Returns null (→ a benign "unavailable" badge) for any
+// repo that is unknown, uninstalled, or has not opted in — so no metrics are ever served otherwise.
+async function loadPublicRepoBadge(env: Env, owner: string, repo: string): Promise<PublicRepoQuality | null> {
+  const repository = await getRepository(env, `${owner}/${repo}`);
+  if (!repository || !repository.isInstalled) return null;
+  const settings = await getRepositorySettings(env, repository.fullName);
+  if (!settings.badgeEnabled) return null;
+  const pullRequests = await listPullRequests(env, repository.fullName);
+  return buildPublicRepoQuality(pullRequests);
+}
 
 async function recordRouteProductUsage(
   c: AppContext,
@@ -557,6 +571,7 @@ const repositorySettingsSchema = z.object({
   requireLinkedIssue: z.boolean().default(false),
   backfillEnabled: z.boolean().default(true),
   privateTrustEnabled: z.boolean().default(true),
+  badgeEnabled: z.boolean().default(false),
   commandAuthorization: z
     .object({
       default: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])).max(4).optional(),
@@ -720,6 +735,30 @@ export function createApp() {
       if (error instanceof Error && error.message === "invalid_github_repo") return c.json({ error: "invalid_github_repo" }, 400);
       return c.json({ error: "github_repo_stats_unavailable" }, 503);
     }
+  });
+
+  // Public-safe README status badge (#541). Unauthenticated and embeddable: it serves ONLY whitelisted,
+  // repo-level metrics, and ONLY for installed repos that opted in via the `badgeEnabled` setting. Excluded
+  // from requiresApiToken above; aggressively cached + stale-while-revalidate like the public stats route.
+  app.get("/v1/public/repos/:owner/:repo/badge.svg", async (c) => {
+    const quality = await loadPublicRepoBadge(c.env, c.req.param("owner"), c.req.param("repo"));
+    c.header("Content-Type", "image/svg+xml; charset=utf-8");
+    if (!quality) {
+      c.header("Cache-Control", "public, max-age=300");
+      return c.body(renderUnavailableBadgeSvg(), 404);
+    }
+    c.header("Cache-Control", "public, max-age=600, stale-while-revalidate=86400");
+    return c.body(renderBadgeSvg(quality));
+  });
+
+  app.get("/v1/public/repos/:owner/:repo/badge.json", async (c) => {
+    const quality = await loadPublicRepoBadge(c.env, c.req.param("owner"), c.req.param("repo"));
+    if (!quality) {
+      c.header("Cache-Control", "public, max-age=300");
+      return c.json({ schemaVersion: 1, label: "gittensory", message: "unavailable", color: "#9e9e9e", cacheSeconds: 300 }, 404);
+    }
+    c.header("Cache-Control", "public, max-age=600, stale-while-revalidate=86400");
+    return c.json(buildShieldsBadge(quality, 600));
   });
 
   app.get("/v1/auth/github/start", async (c) => {
@@ -2710,6 +2749,7 @@ export function createApp() {
         requireLinkedIssue: parsed.data.requireLinkedIssue,
         backfillEnabled: parsed.data.backfillEnabled,
         privateTrustEnabled: parsed.data.privateTrustEnabled,
+        badgeEnabled: parsed.data.badgeEnabled,
         commandAuthorization: normalizeCommandAuthorizationPolicy(parsed.data.commandAuthorization).policy,
       }),
     );
@@ -4255,6 +4295,7 @@ function requiresApiToken(path: string): boolean {
   if (path === "/health") return false;
   if (path === "/v1/mcp/compatibility") return false;
   if (/^\/v1\/public\/github\/repos\/[^/]+\/[^/]+\/stats$/.test(path)) return false;
+  if (/^\/v1\/public\/repos\/[^/]+\/[^/]+\/badge\.(svg|json)$/.test(path)) return false;
   if (path === "/v1/public/subnet-interface") return false;
   if (path === "/openapi.json") return false;
   if (path === "/mcp") return false;

@@ -415,6 +415,7 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
       requireLinkedIssue: false,
       backfillEnabled: true,
       privateTrustEnabled: true,
+      badgeEnabled: false,
       commandAuthorization: normalizeCommandAuthorizationPolicy(DEFAULT_COMMAND_AUTHORIZATION_POLICY).policy,
     };
   }
@@ -446,6 +447,7 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
     requireLinkedIssue: row.requireLinkedIssue,
     backfillEnabled: row.backfillEnabled,
     privateTrustEnabled: row.privateTrustEnabled,
+    badgeEnabled: row.badgeEnabled,
     commandAuthorization: parseCommandAuthorizationPolicy(row.commandAuthorizationJson),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -481,6 +483,7 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
     requireLinkedIssue: settings.requireLinkedIssue ?? false,
     backfillEnabled: settings.backfillEnabled ?? true,
     privateTrustEnabled: settings.privateTrustEnabled ?? true,
+    badgeEnabled: settings.badgeEnabled ?? false,
     commandAuthorization: normalizeCommandAuthorizationPolicy(settings.commandAuthorization).policy,
   };
   const db = getDb(env.DB);
@@ -514,6 +517,7 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
       requireLinkedIssue: resolved.requireLinkedIssue,
       backfillEnabled: resolved.backfillEnabled,
       privateTrustEnabled: resolved.privateTrustEnabled,
+      badgeEnabled: resolved.badgeEnabled,
       commandAuthorizationJson: jsonString(resolved.commandAuthorization),
       updatedAt: nowIso(),
     })
@@ -548,6 +552,7 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
         requireLinkedIssue: resolved.requireLinkedIssue,
         backfillEnabled: resolved.backfillEnabled,
         privateTrustEnabled: resolved.privateTrustEnabled,
+        badgeEnabled: resolved.badgeEnabled,
         commandAuthorizationJson: jsonString(resolved.commandAuthorization),
         updatedAt: nowIso(),
       },
