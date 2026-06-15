@@ -73,6 +73,7 @@ import {
   summarizeRepoSyncOpenPullRequests,
   listSignalSnapshots,
   listPullRequests,
+  listGateOutcomes,
   listRepositories,
   getLatestUpstreamRulesetSnapshot,
   listUpstreamDriftReports,
@@ -156,6 +157,7 @@ import {
 import { buildOperatorDashboardPayload } from "../services/operator-dashboard";
 import { buildSelfDogfoodRegistrationPack, resolveSelfDogfoodRepoFullName } from "../services/self-dogfood-registration-pack";
 import { buildSubnetInterfaceDescriptor } from "../services/subnet-interface";
+import { buildGateFalsePositiveReport } from "../services/gate-telemetry";
 import {
   buildWeeklyValueReport,
   formatWeeklyValueReportMarkdown,
@@ -2713,6 +2715,14 @@ export function createApp() {
         commandAuthorization: normalizeCommandAuthorizationPolicy(parsed.data.commandAuthorization).policy,
       }),
     );
+  });
+
+  // Gate false-positive telemetry (#554). Internal/maintainer-authenticated; never public. Returns the
+  // per-gate-type false-positive rate (blocked-then-merged/overridden) for a repo so maintainers can decide
+  // whether to move a gate from advisory to block. No PII or reward/trust fields.
+  app.get("/v1/internal/repos/:owner/:repo/gate-telemetry", async (c) => {
+    const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
+    return c.json(buildGateFalsePositiveReport(await listGateOutcomes(c.env, fullName), fullName));
   });
 
   // Maintainer BYOK provider key. GET returns secret-free status only; POST stores it encrypted at rest;

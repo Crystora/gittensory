@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, not, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, not, or, sql, type SQL } from "drizzle-orm";
 import { getDb } from "./client";
 import {
   advisories,
@@ -47,6 +47,7 @@ import {
   repoSyncState,
   repositoryAiKeys,
   repositorySettings,
+  gateOutcomes,
   scorePreviews,
   scoringModelSnapshots,
   signalSnapshots,
@@ -134,6 +135,8 @@ import type {
   RepoSyncStateRecord,
   RepositorySettings,
   RepositoryRecord,
+  GateOutcomeRecord,
+  GateOutcomeResolution,
   ScorePreviewRecord,
   ScoringModelSnapshotRecord,
   SignalSnapshotRecord,
@@ -4999,4 +5002,68 @@ export function extractLinkedIssueNumbers(text: string): number[] {
 function extractLinkedPrNumbers(text: string): number[] {
   const matches = [...text.matchAll(/\b(?:PR|pull request)\s+#(\d+)\b/gi)];
   return [...new Set(matches.map((match) => Number(match[1])).filter((value) => Number.isInteger(value) && value > 0))];
+}
+
+// ── Gate false-positive telemetry (#554) ───────────────────────────────────────────────────────────
+
+/** Record (or refresh) a gate HARD-BLOCK for a PR. Re-blocking clears any prior resolution so a block
+ *  that fires again is not still counted as a resolved false positive. */
+export async function recordGateBlockOutcome(
+  env: Env,
+  outcome: { repoFullName: string; prNumber: number; gatePack: string; blockerCodes: string[] },
+): Promise<void> {
+  const db = getDb(env.DB);
+  const now = nowIso();
+  const blockerCodesJson = jsonString([...new Set(outcome.blockerCodes.filter((code) => typeof code === "string" && code.length > 0))]);
+  await db
+    .insert(gateOutcomes)
+    .values({
+      repoFullName: outcome.repoFullName,
+      prNumber: outcome.prNumber,
+      gatePack: outcome.gatePack,
+      blockerCodesJson,
+      blockedAt: now,
+      resolution: null,
+      resolvedAt: null,
+      updatedAt: now,
+    })
+    .onConflictDoUpdate({
+      target: [gateOutcomes.repoFullName, gateOutcomes.prNumber],
+      set: { gatePack: outcome.gatePack, blockerCodesJson, blockedAt: now, resolution: null, resolvedAt: null, updatedAt: now },
+    });
+}
+
+/** Mark a previously blocked PR as a false positive (merged or overridden). No-op unless an unresolved
+ *  block row exists, so a plain close — or a PR that was never blocked — is never counted. */
+export async function resolveGateOutcome(env: Env, repoFullName: string, prNumber: number, resolution: GateOutcomeResolution): Promise<void> {
+  const db = getDb(env.DB);
+  await db
+    .update(gateOutcomes)
+    .set({ resolution, resolvedAt: nowIso(), updatedAt: nowIso() })
+    .where(and(eq(gateOutcomes.repoFullName, repoFullName), eq(gateOutcomes.prNumber, prNumber), isNull(gateOutcomes.resolution)));
+}
+
+export async function listGateOutcomes(env: Env, repoFullName?: string): Promise<GateOutcomeRecord[]> {
+  const db = getDb(env.DB);
+  const rows = repoFullName
+    ? await db.select().from(gateOutcomes).where(eq(gateOutcomes.repoFullName, repoFullName)).limit(1000)
+    : await db.select().from(gateOutcomes).limit(2000);
+  return rows.map(toGateOutcomeRecord);
+}
+
+function toGateOutcomeRecord(row: typeof gateOutcomes.$inferSelect): GateOutcomeRecord {
+  return {
+    repoFullName: row.repoFullName,
+    prNumber: row.prNumber,
+    gatePack: row.gatePack,
+    blockerCodes: parseGateBlockerCodes(row.blockerCodesJson),
+    blockedAt: row.blockedAt,
+    resolution: (row.resolution as GateOutcomeResolution | null) ?? null,
+    resolvedAt: row.resolvedAt ?? null,
+  };
+}
+
+function parseGateBlockerCodes(raw: string): string[] {
+  const parsed = parseJson(raw, [] as unknown);
+  return Array.isArray(parsed) ? parsed.filter((code): code is string => typeof code === "string" && code.length > 0) : [];
 }

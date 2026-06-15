@@ -33,6 +33,8 @@ import {
   createAgentRun,
   replaceAgentActions,
   upsertAgentRecommendationOutcome,
+  recordGateBlockOutcome,
+  resolveGateOutcome,
 } from "../../src/db/repositories";
 import { createApp } from "../../src/api/routes";
 import { clearPublicRepoStatsCacheForTests } from "../../src/github/public";
@@ -191,6 +193,31 @@ describe("api routes", () => {
     const unavailable = await app.request("/v1/public/github/repos/JSONbored/gittensory/stats", {}, env);
     expect(unavailable.status).toBe(503);
     await expect(unavailable.json()).resolves.toMatchObject({ error: "github_repo_stats_unavailable" });
+  });
+
+  it("exposes per-gate-type false-positive telemetry on the internal endpoint (#554)", async () => {
+    const app = createApp();
+    const env = createTestEnv();
+
+    await recordGateBlockOutcome(env, { repoFullName: "acme/widgets", prNumber: 1, gatePack: "gittensor", blockerCodes: ["missing_linked_issue"] });
+    await recordGateBlockOutcome(env, { repoFullName: "acme/widgets", prNumber: 2, gatePack: "gittensor", blockerCodes: ["missing_linked_issue", "duplicate_pr_risk"] });
+    await resolveGateOutcome(env, "acme/widgets", 1, "merged"); // blocked-then-merged → false positive
+
+    const unauthorized = await app.request("/v1/internal/repos/acme/widgets/gate-telemetry", {}, env);
+    expect(unauthorized.status).toBe(401);
+
+    const response = await app.request("/v1/internal/repos/acme/widgets/gate-telemetry", { headers: internalHeaders(env) }, env);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      repoFullName: "acme/widgets",
+      totalBlocked: 2,
+      totalFalsePositives: 1,
+      falsePositiveRate: 0.5,
+      byGateType: expect.arrayContaining([
+        { code: "missing_linked_issue", blocked: 2, falsePositives: 1, falsePositiveRate: 0.5 },
+        { code: "duplicate_pr_risk", blocked: 1, falsePositives: 0, falsePositiveRate: 0 },
+      ]),
+    });
   });
 
   it("rejects invalid public GitHub repo stats paths before calling GitHub", async () => {

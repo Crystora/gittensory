@@ -449,6 +449,37 @@ export type RepositorySettings = {
   updatedAt?: string | null | undefined;
 };
 
+// Gate false-positive telemetry (#554). A blocked PR that is later merged or overridden is a false
+// positive — the hard block did not reflect a real defect.
+export type GateOutcomeResolution = "merged" | "overridden";
+
+export type GateOutcomeRecord = {
+  repoFullName: string;
+  prNumber: number;
+  gatePack: string;
+  blockerCodes: string[];
+  blockedAt: string;
+  resolution?: GateOutcomeResolution | null | undefined;
+  resolvedAt?: string | null | undefined;
+};
+
+export type GateFalsePositiveRate = {
+  /** Gate blocker code (the gate "type"), e.g. `missing_linked_issue`, `duplicate_pr_risk`. */
+  code: string;
+  blocked: number;
+  falsePositives: number;
+  /** falsePositives / blocked, in [0, 1], rounded to 3 dp. */
+  falsePositiveRate: number;
+};
+
+export type GateFalsePositiveReport = {
+  repoFullName: string | null;
+  totalBlocked: number;
+  totalFalsePositives: number;
+  falsePositiveRate: number;
+  byGateType: GateFalsePositiveRate[];
+};
+
 export type CommandAuthorizationRole = "maintainer" | "collaborator" | "pr_author" | "confirmed_miner";
 
 export type RepositoryCommandAuthorizationPolicy = {

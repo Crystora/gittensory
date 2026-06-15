@@ -85,6 +85,7 @@ import { detectNotificationEvents } from "../notifications/events";
 import { deliverNotification, detectIssueWatchEvents, evaluateNotificationEvent } from "../notifications/service";
 import { getOrCreateScoringModelSnapshot, refreshScoringModelSnapshot } from "../scoring/model";
 import { buildAndPersistContributorDecisionPack, loadDecisionPackSharedInputs } from "../services/decision-pack";
+import { recordGateOutcomeForEvaluation, resolveMergedGateOutcome } from "../services/gate-telemetry";
 import {
   buildContributorEvidenceGraph,
   CONTRIBUTOR_EVIDENCE_GRAPH_SIGNAL,
@@ -729,6 +730,9 @@ async function processGitHubWebhook(env: Env, deliveryId: string, eventName: str
     if (payload.repository?.full_name && payload.pull_request) {
       const repoFullName = payload.repository.full_name;
       const pr = await upsertPullRequestFromGitHub(env, repoFullName, payload.pull_request);
+      // Gate false-positive telemetry (#554): a previously gate-blocked PR that is now merged is a false
+      // positive. No-op for non-merge events or PRs that were never blocked.
+      await resolveMergedGateOutcome(env, repoFullName, pr.number, payload.action, payload.pull_request);
       const [repo, settings, otherOpenPullRequests] = await Promise.all([
         getRepository(env, repoFullName),
         resolveRepositorySettings(env, repoFullName),
@@ -1223,6 +1227,9 @@ async function maybePublishPrPublicSurface(
       if (gateCheckResult?.kind === "permission_missing") {
         await auditGateCheckPermissionMissing(env, author, repoFullName, pr.number, webhook.deliveryId, gateCheckResult.warning);
       }
+      // Gate false-positive telemetry (#554): record a hard block so an eventual merge can mark it a false
+      // positive. No-op unless the gate concluded `failure` (confirmed-contributor hard block).
+      await recordGateOutcomeForEvaluation(env, { repoFullName, prNumber: pr.number, gatePack: settings.gatePack, evaluation: gateEvaluation });
     }
   } catch (error) {
     // The pending Gate check was posted but evaluation could not finish. Finalize it to a neutral

@@ -1,4 +1,4 @@
-import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 // Timestamp columns use a drizzle $defaultFn so an insert that omits the column gets a real ISO-8601
 // timestamp. A static `.default("CURRENT_TIMESTAMP")` would make drizzle inject the literal STRING
 // "CURRENT_TIMESTAMP" (it applies static defaults client-side, never reaching SQLite's CURRENT_TIMESTAMP),
@@ -90,6 +90,24 @@ export const repositoryAiKeys = sqliteTable("repository_ai_keys", {
   createdAt: text("created_at").notNull().$defaultFn(() => nowIso()),
   updatedAt: text("updated_at").notNull().$defaultFn(() => nowIso()),
 });
+
+// Gate false-positive telemetry (#554): the latest hard-block per (repo, PR), correlated with an eventual
+// merge/override so the maintainer dashboard can show each gate type's false-positive rate. No PII.
+export const gateOutcomes = sqliteTable(
+  "gate_outcomes",
+  {
+    repoFullName: text("repo_full_name").notNull(),
+    prNumber: integer("pr_number").notNull(),
+    gatePack: text("gate_pack").notNull().default("gittensor"),
+    blockerCodesJson: text("blocker_codes_json").notNull().default("[]"),
+    blockedAt: text("blocked_at").notNull(),
+    resolution: text("resolution"),
+    resolvedAt: text("resolved_at"),
+    createdAt: text("created_at").notNull().$defaultFn(() => nowIso()),
+    updatedAt: text("updated_at").notNull().$defaultFn(() => nowIso()),
+  },
+  (table) => [primaryKey({ columns: [table.repoFullName, table.prNumber] }), index("gate_outcomes_resolution_idx").on(table.resolution)],
+);
 
 export const repoSyncState = sqliteTable("repo_sync_state", {
   repoFullName: text("repo_full_name").primaryKey(),
