@@ -335,6 +335,8 @@ import {
   buildReviewEnrichment,
   isEnrichmentEnabled,
   isReesGithubTokenForwardingEnabled,
+  resolveEnrichmentLinkedIssue,
+  resolveEnrichmentLinkedIssueNumbers,
 } from "../review/enrichment-wire";
 import { captureReviewFailure } from "../selfhost/sentry";
 import { evaluateWithSurfaceLane } from "../review/content-lane-wire";
@@ -3646,6 +3648,7 @@ export async function runAiReviewForAdvisory(
       title: string;
       body?: string | null | undefined;
       baseSha?: string | null | undefined;
+      linkedIssues?: number[] | undefined;
     };
     author: string | null;
     confirmedContributor: boolean;
@@ -3827,6 +3830,14 @@ export async function runAiReviewForAdvisory(
             title: args.pr.title,
             body: args.pr.body ?? undefined,
             author: args.author,
+            linkedIssue: await resolveEnrichmentLinkedIssue(
+              env,
+              args.repoFullName,
+              resolveEnrichmentLinkedIssueNumbers(
+                args.pr.linkedIssues,
+                args.pr.body,
+              ),
+            ),
             githubToken: isReesGithubTokenForwardingEnabled(env)
               ? await resolveReviewEnrichmentGithubToken(
                   env,
