@@ -41,6 +41,6 @@ if (
   process.exit(0);
 }
 
-const exitCode = runCli(cliArgs, { packageName });
+const exitCode = await runCli(cliArgs, { packageName, env: process.env });
 await awaitOpportunisticUpdateCheck(updateCheck);
 process.exit(exitCode);
