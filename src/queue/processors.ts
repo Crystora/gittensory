@@ -26,6 +26,7 @@ import {
   listSignalSnapshots,
   listRepoGithubTotalsSnapshotHistory,
   listOtherOpenPullRequests,
+  listOpenIssues,
   listOpenPullRequests,
   listPullRequests,
   listPullRequestFiles,
@@ -78,6 +79,7 @@ import {
   fetchLinkedIssueFacts,
   fetchLiveCiAggregatePreferGraphQl,
   type LiveCiAggregate,
+  fetchLiveIssueState,
   fetchLivePullRequest,
   fetchLivePullRequestHeadSha,
   fetchLivePullRequestMergeState,
@@ -232,6 +234,7 @@ import {
 } from "../settings/agent-actions";
 import {
   executeAgentMaintenanceActions,
+  executeIssueMaintenanceActions,
   pendingClosureLabelApplied,
 } from "../services/agent-action-executor";
 import { processSubmitDraft } from "../services/draft";
@@ -1738,7 +1741,7 @@ async function runAgentMaintenancePlanAndExecute(
     liveFacts: LiveGithubFacts;
   },
 ): Promise<void> {
-  const { installationId, repoFullName, pr, settings, otherOpenPullRequests, gate } = args;
+  const { installationId, repoFullName, pr, settings, otherOpenPullRequests, deliveryId, gate } = args;
 
   // Convergence safety: feed the planner the PR's changed paths + the repo's hard-guardrail globs so guarded
   // paths force manual review, and flag owner-authored PRs so they are never auto-closed (standing rule).
@@ -1861,6 +1864,40 @@ async function runAgentMaintenancePlanAndExecute(
     settings.contributorBlacklist,
   );
 
+  // Per-contributor open-PR cap (#2270, anti-abuse): count this author's OTHER currently-open PRs on this repo
+  // (otherOpenPullRequests already excludes the current PR — see reconcileLiveDuplicateSiblings) plus this one,
+  // ranked by PR NUMBER (GitHub's own creation order, not webhook-arrival order) so a burst of near-simultaneous
+  // opens still ranks deterministically. Only matches when THIS PR's number is among the ones over the cap — an
+  // older sibling that was already under the cap when it was opened stays open. The owner/admin/automation-bot
+  // exemption is applied by the planner itself (defense-in-depth, mirroring how blacklistEntry above is resolved
+  // unconditionally and exempted only inside planAgentMaintenanceActions). Disabled (null/undefined cap, the
+  // default) ⇒ this block is a no-op.
+  let contributorCapMatch: { matched: boolean; authorLogin: string; openCount: number; cap: number; itemKind: "pull requests" | "issues" } | undefined;
+  const contributorOpenPrCap = settings.contributorOpenPrCap;
+  if (typeof contributorOpenPrCap === "number" && pr.authorLogin) {
+    const authorLoginLower = pr.authorLogin.toLowerCase();
+    const authorOpenPrNumbers = otherOpenPullRequests
+      .filter((other) => (other.authorLogin ?? "").toLowerCase() === authorLoginLower)
+      .map((other) => other.number)
+      .concat(pr.number)
+      .sort((a, b) => a - b);
+    const overCapNumbers = new Set(authorOpenPrNumbers.slice(contributorOpenPrCap));
+    if (overCapNumbers.has(pr.number)) {
+      contributorCapMatch = { matched: true, authorLogin: pr.authorLogin, openCount: authorOpenPrNumbers.length, cap: contributorOpenPrCap, itemKind: "pull requests" };
+    }
+    // Webhook-delivery-order guard (#2479 gate finding): delivery order is not guaranteed to match PR creation
+    // order, so a sibling PR's own webhook can process before THIS PR exists in the DB and wrongly conclude the
+    // author is within the cap — nothing else would ever re-evaluate it, permanently bypassing the cap for that
+    // sibling. Now that THIS delivery has the complete picture, wake any OTHER still-open sibling that's also
+    // in the over-cap set so its own next pass re-evaluates against the complete set and self-corrects.
+    const otherOverCapSiblingNumbers = otherOpenPullRequests
+      .filter((other) => (other.authorLogin ?? "").toLowerCase() === authorLoginLower && overCapNumbers.has(other.number))
+      .map((other) => other.number);
+    if (otherOverCapSiblingNumbers.length > 0) {
+      await wakeOverCapSiblingPullRequests(env, deliveryId, installationId, repoFullName, otherOverCapSiblingNumbers);
+    }
+  }
+
   const planned = planAgentMaintenanceActions({
     conclusion: gate.conclusion,
     blockerTitles: gate.blockers.map((blocker) => blocker.title),
@@ -1885,6 +1922,10 @@ async function runAgentMaintenancePlanAndExecute(
       : {}),
     // Always threaded (the DB layer populates it, default "slop"); the planner applies its own fallback.
     blacklistLabel: settings.blacklistLabel,
+    ...(contributorCapMatch !== undefined ? { contributorCapMatch } : {}),
+    // Always threaded (the DB layer populates it, default "over-contributor-limit"); the planner applies its
+    // own fallback.
+    contributorCapLabel: settings.contributorCapLabel,
     ...(linkedIssueHardRule !== undefined ? { linkedIssueHardRule } : {}),
     // Flag-then-close double-check: thread the loaded verify config so the planner FLAGS first then closes on
     // re-verification (default ON). Only passed when a rule is on (the planner reads it only for a violation).
@@ -2504,6 +2545,51 @@ async function scheduleTrailingIssueLinkedReReview(
     return; // do NOT claim — a later coalesced event in this window should retry the enqueue
   }
   await putTransientKey(env, key, "1", CI_COALESCE_WINDOW_SECONDS);
+}
+
+/** Best-effort wake for sibling PRs discovered to be over the per-contributor cap by a LATER delivery (#2270,
+ *  #2479 gate finding): webhook delivery order isn't guaranteed to match PR creation order, so a sibling's own
+ *  webhook can fire before this one exists in the DB and wrongly conclude the author is within the cap — with
+ *  nothing else to ever re-evaluate it, that verdict would otherwise stand forever. Reuses the existing
+ *  agent-regate-pr sweep-unit job (already rate-limit-aware and retried) — the SAME "wake and fully
+ *  re-evaluate" entry point the linked-issue-wake feature (#2259) uses for an identical class of problem, so
+ *  the sibling gets its own live-head/CI-freshness re-check before anything acts on it, not a shortcut based
+ *  on this delivery's now-possibly-stale snapshot. Coalesced per sibling PR (mirrors
+ *  scheduleTrailingIssueLinkedReReview's check-then-claim-after-success shape) so a burst of N over-cap
+ *  siblings each discovering the same others doesn't fan out into an O(N^2) job storm. */
+async function wakeOverCapSiblingPullRequests(
+  env: Env,
+  deliveryId: string,
+  installationId: number,
+  repoFullName: string,
+  siblingPrNumbers: number[],
+): Promise<void> {
+  await Promise.all(
+    siblingPrNumbers.map(async (prNumber) => {
+      const key = `contributor-cap-wake:${repoFullName.toLowerCase()}#${prNumber}`;
+      if (await getTransientKey(env, key)) return;
+      try {
+        await env.JOBS.send({
+          type: "agent-regate-pr",
+          deliveryId,
+          repoFullName,
+          prNumber,
+          installationId,
+        });
+      } catch (error) {
+        console.log(
+          JSON.stringify({
+            ev: "contributor_cap_wake_enqueue_failed",
+            repoFullName,
+            pull: prNumber,
+            message: errorMessage(error).slice(0, 120),
+          }),
+        );
+        return; // do NOT claim — a later discovery should retry the enqueue
+      }
+      await putTransientKey(env, key, "1", CI_COALESCE_WINDOW_SECONDS);
+    }),
+  );
 }
 
 async function ciHeadShaResolutionCoalesced(
@@ -3490,6 +3576,112 @@ async function loadOpenQueueCounts(
   };
 }
 
+/**
+ * Per-contributor open-ISSUE cap (#2270, anti-abuse): the first `eventName === "issues"` actuation branch —
+ * issues have no other auto-close path today. Mirrors the PR-path cap in runAgentMaintenancePlanAndExecute:
+ * counts the author's currently-open issues on this repo (including this one), ranked by issue NUMBER
+ * (GitHub's own creation order, not webhook-arrival order). Reuses planAgentMaintenanceActions to build the
+ * SAME label+close plan the PR path uses (identical closeKind/label/close-comment construction): passing
+ * `conclusion: "skipped"` and no `blacklistMatch` guarantees the function returns at the contributor_cap
+ * short-circuit (the very next check in the planner) before ever touching any PR/CI-specific field, so
+ * building a plan for an issue this way is safe.
+ *
+ * Webhook-delivery-order guard (#2479 gate finding, mirrored here for issues): delivery order is not
+ * guaranteed to match issue creation order, so an OLDER sibling's own webhook can process before a NEWER
+ * sibling exists in the DB and wrongly conclude the author is within the cap — closing only "the incoming
+ * issue, if it's over cap" would let that stale verdict stand forever, since nothing else ever re-evaluates
+ * it. Closes EVERY number in the over-cap set discovered by THIS delivery, not just the incoming issue, so
+ * whichever delivery happens to see the complete picture corrects any sibling a prior delivery missed. Unlike
+ * the PR path (which enqueues a `agent-regate-pr` wake job so each sibling gets its own live-head/CI-freshness
+ * re-check before acting), issues have no head SHA or CI to go stale, and there's no issue-side "regate" job
+ * type to reuse — so that PARTICULAR staleness risk does not apply here.
+ *
+ * Stale-closed-sibling guard (#2479 gate finding): a DIFFERENT staleness risk DOES apply — `listOpenIssues`
+ * reads the local DB cache, which can still say `open` for a sibling already closed on GitHub (manually, by
+ * another automation, or by a webhook this instance hasn't processed yet). An inflated count from such a stale
+ * row could wrongly put a newly opened issue over the REAL cap. Guarded by live-verifying each counted sibling
+ * below before trusting it -- and unlike a non-final ranking signal, an inconclusive live check here is treated
+ * as NOT open (excluded from the count), never left as an unverified "counts toward the cap" default, because
+ * this count gates an irreversible close (#2479 gate finding, second pass).
+ */
+async function maybeCloseIssueOverContributorCap(
+  env: Env,
+  args: { installationId: number; repoFullName: string; issue: IssueRecord; settings: RepositorySettings },
+): Promise<void> {
+  const { installationId, repoFullName, issue, settings } = args;
+  const cap = settings.contributorOpenIssueCap;
+  const authorLogin = issue.authorLogin;
+  if (typeof cap !== "number" || !authorLogin) return;
+
+  const repoOwner = repoFullName.includes("/") ? repoFullName.slice(0, repoFullName.indexOf("/")) : "";
+  const authorIsOwner = authorLogin.toLowerCase() === repoOwner.toLowerCase();
+  const authorIsAdmin = parseGitHubLoginList(env.ADMIN_GITHUB_LOGINS).has(authorLogin.toLowerCase());
+  const authorIsAutomationBot = isProtectedAutomationAuthor(authorLogin);
+  if (authorIsOwner || authorIsAdmin || authorIsAutomationBot) return;
+
+  const otherOpenIssues = await listOpenIssues(env, repoFullName);
+  const authorLoginLower = authorLogin.toLowerCase();
+  const otherAuthorIssueNumbers = otherOpenIssues
+    .filter((other) => (other.authorLogin ?? "").toLowerCase() === authorLoginLower && other.number !== issue.number)
+    .map((other) => other.number);
+
+  // Live-verify each OTHER counted sibling before trusting it toward the cap (#2479 gate finding): the stored
+  // open-issue cache lags GitHub, so a sibling already closed elsewhere (manually, by another automation, or a
+  // webhook this instance hasn't processed yet) can still read `open` here and inflate the count enough to close
+  // a newly opened issue that is actually within the real cap. `issue` itself is trusted unverified -- it is the
+  // issue THIS webhook just delivered, so it is open by construction.
+  //
+  // Fail SAFE (not open, per gate finding on this exact block, second pass), NOT fail-open-to-stored like
+  // reconcileLiveDuplicateSiblings: that helper only re-ranks a duplicate-cluster WINNER (a non-final signal
+  // recomputed every delivery), so failing open there just risks a transient wrong ranking. Here the count
+  // directly gates an IRREVERSIBLE close, so an unreadable live check (a transient fetch failure) must NOT be
+  // allowed to compound with a stale "open" DB row and tip a within-cap issue into being wrongly closed --
+  // any sibling this delivery cannot POSITIVELY confirm is still open is excluded from the count. The cost is
+  // symmetric-but-safe: a transient miss can undercount and momentarily under-enforce the cap, but that is
+  // self-correcting (the delivery-order guard below already re-evaluates on every subsequent issue-open), while
+  // a wrongful close is not.
+  const token = await createInstallationToken(env, installationId).catch(() => undefined);
+  const liveToken = token ?? env.GITHUB_PUBLIC_TOKEN;
+  const admissionKey = githubAdmissionKeyForToken(env, installationId, liveToken);
+  const confirmedOpen = new Set<number>();
+  await Promise.all(
+    otherAuthorIssueNumbers.map(async (number) => {
+      const liveState = await fetchLiveIssueState(env, repoFullName, number, liveToken, admissionKey).catch(() => undefined);
+      if (liveState === "open") confirmedOpen.add(number);
+    }),
+  );
+  const authorOpenIssueNumbers = otherAuthorIssueNumbers
+    .filter((number) => confirmedOpen.has(number))
+    .concat(issue.number)
+    .sort((a, b) => a - b);
+  const overCapNumbers = new Set(authorOpenIssueNumbers.slice(cap));
+  if (overCapNumbers.size === 0) return;
+
+  const planned = planAgentMaintenanceActions({
+    conclusion: "skipped",
+    blockerTitles: [],
+    autonomy: settings.autonomy,
+    changedPaths: [],
+    hardGuardrailGlobs: [],
+    authorIsOwner,
+    authorIsAdmin,
+    authorIsAutomationBot,
+    ciState: "unverified",
+    contributorCapMatch: { matched: true, authorLogin, openCount: authorOpenIssueNumbers.length, cap, itemKind: "issues" },
+    contributorCapLabel: settings.contributorCapLabel,
+    pr: { labels: [] },
+  });
+  if (planned.length === 0) return;
+
+  for (const overCapNumber of overCapNumbers) {
+    await executeIssueMaintenanceActions(
+      env,
+      { installationId, repoFullName, issueNumber: overCapNumber, autonomy: settings.autonomy, agentPaused: settings.agentPaused, agentDryRun: settings.agentDryRun },
+      planned,
+    );
+  }
+}
+
 async function processGitHubWebhook(
   env: Env,
   deliveryId: string,
@@ -4066,6 +4258,28 @@ async function processGitHubWebhook(
         );
       }
       await persistAdvisory(env, advisory);
+      // Per-contributor open-issue cap (#2270, anti-abuse): the first issue-side auto-close path. Best-effort —
+      // a failure here must never affect the advisory/notification handling above or the webhook overall.
+      if (payload.action === "opened" && installationId) {
+        await maybeCloseIssueOverContributorCap(env, {
+          installationId,
+          repoFullName: payload.repository.full_name,
+          issue,
+          settings: issueSettings,
+        }).catch((error) => {
+          /* v8 ignore next -- best-effort: an issue-cap enforcement failure is logged, never surfaced to the webhook. */
+          console.error(
+            JSON.stringify({
+              level: "warn",
+              event: "contributor_issue_cap_failed",
+              deliveryId,
+              repository: payload.repository?.full_name,
+              issueNumber: issue.number,
+              error: errorMessage(error),
+            }),
+          );
+        });
+      }
       // #699 path B: a newly opened grabbable, high-multiplier issue notifies the miners watching this repo
       // (fanned out through the same #535 pipeline below).
       if (payload.action === "opened")
