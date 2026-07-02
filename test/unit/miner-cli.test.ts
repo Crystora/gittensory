@@ -131,6 +131,7 @@ describe("gittensory-miner CLI helpers", () => {
       { with: { type: "json" } }
     );
     expect(packageJson.default.version).toBe("0.1.0");
+    expect(packageJson.default.engines.node).toBe(">=22.5.0");
   });
 });
 

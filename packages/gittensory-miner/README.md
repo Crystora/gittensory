@@ -45,6 +45,8 @@ gittensory-miner doctor
 
 Laptop mode is the zero-infra install-and-run path for local miner state. It uses a local SQLite state file and does not require Docker, Redis, or Postgres.
 
+Laptop mode requires Node.js 22.5.0 or newer because it uses Node's built-in SQLite module.
+
 ```sh
 npm install -g @jsonbored/gittensory-miner@latest
 gittensory-miner init
